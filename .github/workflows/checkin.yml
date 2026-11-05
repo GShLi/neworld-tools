@@ -1,0 +1,54 @@
+name: Neworld daily check-in
+
+on:
+  schedule:
+    # 00:10 UTC = 08:10 Asia/Shanghai, every day.
+    - cron: '10 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neworld-daily-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Restore Chromium cache
+        id: chromium-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: chromium-headless-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('requirements.txt') }}
+      - name: Install Chromium
+        # Checks cached browser files; Linux system libraries still need installation.
+        run: python -m playwright install --with-deps --only-shell chromium
+      - name: Save Chromium cache
+        if: steps.chromium-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ steps.chromium-cache.outputs.cache-primary-key }}
+      - name: Validate automation
+        run: python -m unittest discover -s tests -v
+      - name: Sign in and claim today's reward
+        env:
+          NEWORLD_USERNAME: ${{ secrets.username }}
+          NEWORLD_PASSWORD: ${{ secrets.password }}
+        run: |
+          if [ -z "$NEWORLD_USERNAME" ] || [ -z "$NEWORLD_PASSWORD" ]; then
+            echo '::error::Set repository Actions secrets: username and password.'
+            exit 1
+          fi
+          python neworld_checkin.py --wait-seconds 60
