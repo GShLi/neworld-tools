@@ -7,7 +7,9 @@ from datetime import date, datetime
 import hashlib
 import os
 from pathlib import Path
+import re
 import sys
+from time import monotonic
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -40,6 +42,22 @@ def response_state(data):
 
 def log(message):
     print(f"[{datetime.now(BEIJING):%Y-%m-%d %H:%M:%S} +08:00] {message}", flush=True)
+
+
+@contextmanager
+def browser_step(label, hint=""):
+    from playwright.sync_api import Error, TimeoutError
+
+    log(label + "。")
+    try:
+        yield
+    except Error as exc:
+        # Full Playwright call logs may contain passwords, cookies or form values.
+        category = "等待超时" if isinstance(exc, TimeoutError) else "浏览器操作失败"
+        network = re.search(r"\bnet::ERR_[A-Z_]+\b", str(exc))
+        if network:
+            category += f"（{network.group(0)}）"
+        raise AutomationError(f"{label}：{category}。{hint}") from exc
 
 
 def load_credentials():
@@ -94,11 +112,13 @@ def read_response(response):
 
 
 def login(page, credentials, *, wait_ms):
-    page.goto(BASE_URL + "/user", wait_until="domcontentloaded")
-    page.wait_for_function(
-        "() => document.querySelector('#email, #check-in, #check-in-done')",
-        timeout=wait_ms,
-    )
+    with browser_step("打开用户页面", "请检查站点连接或入口安全验证。"):
+        page.goto(BASE_URL + "/user", wait_until="domcontentloaded", timeout=wait_ms)
+    with browser_step("等待登录表单或用户面板", "页面可能被安全验证拦截或结构已变化。"):
+        page.wait_for_function(
+            "() => document.querySelector('#email, #check-in, #check-in-done')",
+            timeout=wait_ms,
+        )
     if is_user_page(page):
         log("已复用登录状态。")
         return
@@ -108,12 +128,14 @@ def login(page, credentials, *, wait_ms):
     email, password = credentials["username"], credentials["password"]
     if not email or not password:
         raise AutomationError("请设置 NEWORLD_USERNAME 和 NEWORLD_PASSWORD 环境变量。")
-    page.locator("#email").fill(email)
-    page.locator("#passwd").fill(password)
+    with browser_step("填写登录表单"):
+        page.locator("#email").fill(email, timeout=wait_ms)
+        page.locator("#passwd").fill(password, timeout=wait_ms)
     # The real page uses this variable when sending /auth/login.
-    page.wait_for_function("() => typeof visitorId !== 'undefined' && !!visitorId",
-                           timeout=wait_ms)
-    with page.expect_response(
+    with browser_step("等待网站浏览器指纹", "请检查网站指纹脚本是否加载成功。"):
+        page.wait_for_function("() => typeof visitorId !== 'undefined' && !!visitorId",
+                               timeout=wait_ms)
+    with browser_step("提交登录并等待登录接口"), page.expect_response(
         lambda r: is_site_url(r.url, "/auth/login") and r.request.method == "POST",
         timeout=wait_ms,
     ) as pending:
@@ -130,14 +152,48 @@ def login(page, credentials, *, wait_ms):
     if not isinstance(result, dict) or str(result.get("ret")) != "1":
         raise AutomationError("登录失败，请检查邮箱、密码和两步验证设置。")
 
-    page.wait_for_url(lambda url: is_site_url(url, "/user"), timeout=wait_ms)
-    page.locator("#check-in").wait_for(state="attached", timeout=wait_ms)
+    with browser_step("等待登录后的用户页面"):
+        page.wait_for_url(lambda url: is_site_url(url, "/user"), timeout=wait_ms)
+        page.locator("#check-in").wait_for(state="attached", timeout=wait_ms)
     if not is_user_page(page):
         raise AutomationError("登录后没有找到签到页面。")
     log("登录成功。")
 
 
-def submit_checkin(page, button):
+def dismiss_notices(page, wait_ms):
+    modal = page.locator("#short-msg-dialog")
+    if not modal.is_visible():
+        return
+    deadline = monotonic() + wait_ms / 1000
+    with browser_step("处理站内公告", "公告倒计时未结束或控件不可用；未提交签到。"):
+        while modal.is_visible():
+            remaining = int((deadline - monotonic()) * 1000)
+            if remaining <= 0:
+                raise AutomationError("处理站内公告超时；未提交签到，可增加 --wait-seconds。")
+            ready = page.wait_for_function("""() => {
+                const modal = document.querySelector('#short-msg-dialog');
+                if (!modal || !modal.getClientRects().length) return 'hidden';
+                const close = modal.querySelector('.btn-close');
+                const next = modal.querySelector('[data-next]');
+                if (close && !close.disabled && close.getClientRects().length) return 'close';
+                if (next && !next.disabled && next.getClientRects().length) return 'next';
+                return false;
+            }""", timeout=remaining)
+            action = ready.json_value()
+            ready.dispose()
+            if action == "hidden":
+                return
+            selector = ".btn-close" if action == "close" else "[data-next]"
+            # Use the site's controls only after its countdown enables them.
+            modal.locator(selector).click(timeout=max(1, int((deadline - monotonic()) * 1000)))
+            if action == "close":
+                modal.wait_for(state="hidden", timeout=max(1, int((deadline - monotonic()) * 1000)))
+        log("站内公告已关闭。")
+
+
+def submit_checkin(page, button, wait_ms):
+    from playwright.sync_api import TimeoutError
+
     # Recalculate immediately before EVERY submission (including after a CAPTCHA).
     reward = choose_reward()
     radio = page.locator(f'input[name="checkin_type"][value="{reward}"]')
@@ -152,11 +208,29 @@ def submit_checkin(page, button):
     if not radio.is_checked():
         raise AutomationError("未能选中目标领取类型，停止操作。")
     log(f"按北京时间选择领取{LABELS[reward]}。")
-    with page.expect_response(
-        lambda r: is_site_url(r.url, "/user/checkin") and r.request.method == "POST",
-        timeout=30000,
-    ) as pending:
-        page.locator(button).click()
+    requests = []
+
+    def observe_request(request):
+        if is_site_url(request.url, "/user/checkin") and request.method == "POST":
+            requests.append(request)
+
+    page.on("request", observe_request)
+    try:
+        with page.expect_response(
+            lambda r: is_site_url(r.url, "/user/checkin") and r.request.method == "POST",
+            timeout=wait_ms,
+        ) as pending:
+            label = "点击签到按钮" if button == "#check-in" else "点击验证后的确认签到按钮"
+            with browser_step(label, "按钮可能被弹窗遮挡或不可用；请检查站内公告。"):
+                page.locator(button).click(timeout=wait_ms)
+            log("签到按钮已点击，等待签到接口响应。")
+    except TimeoutError as exc:
+        if requests:
+            raise AutomationError("已发出签到请求，但等待接口响应超时；领取结果未知，"
+                                  "本次不重试，请先检查网站签到状态。") from exc
+        raise AutomationError("按钮已点击，但未观察到签到请求；签到脚本可能未加载或执行失败。") from exc
+    finally:
+        page.remove_listener("request", observe_request)
     return response_state(read_response(pending.value)), reward
 
 
@@ -172,15 +246,17 @@ def checkin(page, *, dry_run=False, wait_ms=180000):
     if not page.locator("#check-in").is_visible():
         raise AutomationError("签到按钮不可用，停止操作。")
 
-    state, reward = submit_checkin(page, "#check-in")
+    dismiss_notices(page, wait_ms)
+    state, reward = submit_checkin(page, "#check-in", wait_ms)
     if state == "captcha":
         log("网站要求安全验证，等待自动验证结果；本脚本不支持人工验证。")
-        page.wait_for_function("""() => {
-            const dialog = document.querySelector('#captcha-dialog');
-            const button = document.querySelector('#captcha-submit');
-            return dialog && dialog.getClientRects().length && button && !button.disabled;
-        }""", timeout=wait_ms)
-        state, reward = submit_checkin(page, "#captcha-submit")
+        with browser_step("等待签到安全验证", "网站未自动完成验证；无界面模式无法人工处理。"):
+            page.wait_for_function("""() => {
+                const dialog = document.querySelector('#captcha-dialog');
+                const button = document.querySelector('#captcha-submit');
+                return dialog && dialog.getClientRects().length && button && !button.disabled;
+            }""", timeout=wait_ms)
+        state, reward = submit_checkin(page, "#captcha-submit", wait_ms)
     if state != "success":
         raise AutomationError("验证后仍被要求再次验证，停止本次运行。")
     log(f"签到成功：领取{LABELS[reward]}。")
@@ -222,13 +298,14 @@ def main(argv=None):
     try:
         credentials = load_credentials()
         with profile_lock(args.state_dir), sync_playwright() as playwright:
-            context = playwright.chromium.launch_persistent_context(
-                str(profile_path(args.state_dir, credentials["username"])), headless=True,
-                timezone_id="Asia/Shanghai", locale="zh-CN",
-            )
+            with browser_step("启动无界面浏览器", "请确认已安装 Chromium Headless Shell 和系统依赖。"):
+                context = playwright.chromium.launch_persistent_context(
+                    str(profile_path(args.state_dir, credentials["username"])), headless=True,
+                    timezone_id="Asia/Shanghai", locale="zh-CN",
+                )
             try:
                 page = context.pages[0] if context.pages else context.new_page()
-                page.set_default_timeout(30000)
+                page.set_default_timeout(args.wait_seconds * 1000)
                 login(page, credentials, wait_ms=args.wait_seconds * 1000)
                 if args.login_only:
                     log("登录状态已保存在本地。")

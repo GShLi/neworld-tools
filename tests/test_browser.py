@@ -66,6 +66,7 @@ class BrowserTests(unittest.TestCase):
         self.login_requests = []
         self.checkin_requests = []
         self.results = [{"ret": 1, "msg": "ok"}]
+        self.abort_checkin = False
         self.context.route("**/*", self.route)
 
     def tearDown(self):
@@ -80,6 +81,9 @@ class BrowserTests(unittest.TestCase):
             route.fulfill(json=self.login_result)
         elif path == "/user/checkin":
             self.checkin_requests.append(parse_qs(request.post_data))
+            if self.abort_checkin:
+                route.abort("connectionreset")
+                return
             result = self.results.pop(0)
             route.fulfill(json=result)
         elif path == "/user" and not self.authenticated:
@@ -151,6 +155,61 @@ class BrowserTests(unittest.TestCase):
         self.results = [{"ret":0, "msg":"denied"}]
         with self.assertRaises(AutomationError):
             checkin(self.page)
+        self.assertEqual(len(self.checkin_requests), 1)
+
+    def test_notice_countdowns_and_pages_are_completed_before_checkin(self):
+        self.page.goto("https://neworld.cloud/user")
+        self.page.evaluate("""() => {
+            const modal = document.createElement('div');
+            modal.id = 'short-msg-dialog';
+            modal.style = 'position:fixed;inset:0;background:white;z-index:1000';
+            modal.innerHTML = '<button data-next disabled>下一条</button>' +
+                              '<button class="btn-close" disabled>关闭</button>';
+            document.body.appendChild(modal);
+            window.noticeActions = [];
+            const next = modal.querySelector('[data-next]');
+            const close = modal.querySelector('.btn-close');
+            setTimeout(() => next.disabled = false, 80);
+            next.onclick = () => {
+                window.noticeActions.push('next');
+                next.disabled = true;
+                setTimeout(() => close.disabled = false, 80);
+            };
+            close.onclick = () => {
+                window.noticeActions.push('close');
+                modal.style.display = 'none';
+            };
+        }""")
+        self.assertEqual(checkin(self.page, wait_ms=1500), "success")
+        self.assertEqual(self.page.evaluate("noticeActions"), ["next", "close"])
+        self.assertEqual(len(self.checkin_requests), 1)
+
+    def test_notice_timeout_is_specific_and_does_not_submit(self):
+        self.page.goto("https://neworld.cloud/user")
+        self.page.evaluate("""() => {
+            const modal = document.createElement('div');
+            modal.id = 'short-msg-dialog';
+            modal.style = 'position:fixed;inset:0;background:white;z-index:1000';
+            modal.innerHTML = '<button data-next disabled>下一条</button>' +
+                              '<button class="btn-close" disabled>关闭</button>';
+            document.body.appendChild(modal);
+        }""")
+        with self.assertRaisesRegex(AutomationError, "公告"):
+            checkin(self.page, wait_ms=150)
+        self.assertEqual(self.checkin_requests, [])
+
+    def test_missing_click_handler_reports_no_request(self):
+        self.page.goto("https://neworld.cloud/user")
+        self.page.locator('#check-in').evaluate('el => el.onclick = null')
+        with self.assertRaisesRegex(AutomationError, "未观察到签到请求"):
+            checkin(self.page, wait_ms=150)
+        self.assertEqual(self.checkin_requests, [])
+
+    def test_request_failure_reports_uncertain_result_and_no_retry(self):
+        self.page.goto("https://neworld.cloud/user")
+        self.abort_checkin = True
+        with self.assertRaisesRegex(AutomationError, "已发出签到请求"):
+            checkin(self.page, wait_ms=150)
         self.assertEqual(len(self.checkin_requests), 1)
 
 

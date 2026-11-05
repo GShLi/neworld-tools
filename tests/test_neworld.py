@@ -63,5 +63,27 @@ class ResponseTests(unittest.TestCase):
                 response_state(data)
 
 
+class DiagnosticTests(unittest.TestCase):
+    def test_error_reports_stage_without_exposing_playwright_call_log(self):
+        from playwright.sync_api import Error
+
+        with self.assertRaises(AutomationError) as caught:
+            with neworld_checkin.browser_step("填写登录表单"):
+                raise Error('Locator.fill: secret-password test@example.com token=secret')
+        message = str(caught.exception)
+        self.assertIn("填写登录表单", message)
+        self.assertNotIn("secret", message)
+        self.assertNotIn("test@example.com", message)
+
+    def test_network_error_keeps_only_safe_error_code(self):
+        from playwright.sync_api import Error
+
+        with self.assertRaises(AutomationError) as caught:
+            with neworld_checkin.browser_step("打开用户页面"):
+                raise Error('net::ERR_CONNECTION_RESET at https://example.com/?token=secret')
+        self.assertIn("net::ERR_CONNECTION_RESET", str(caught.exception))
+        self.assertNotIn("token", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

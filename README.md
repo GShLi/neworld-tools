@@ -120,3 +120,5 @@ schedule:
 GitHub 定时任务可能延迟，且只在默认分支运行；公共仓库连续 60 天无活动时，定时工作流可能被自动禁用，需要重新启用。参见 [GitHub 定时任务说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)。
 
 如果网站要求人工验证码，或账号需要两步验证码但未提供，任务会失败。本项目仅支持无界面运行，不提供人工验证或验证码绕过功能。
+
+日志会标明失败阶段，例如登录、站内公告、点击签到按钮或等待签到接口。站内公告会在倒计时结束后逐页关闭；等待时间不足可调整 `--wait-seconds`。若日志提示“已发出签到请求”但没有收到响应，领取结果未知，请先检查网站状态，避免重复提交。
